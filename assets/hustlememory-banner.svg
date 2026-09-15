@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="400" viewBox="0 0 1280 400" role="img" aria-labelledby="title desc">
+  <title id="title">HustleMemory</title>
+  <desc id="desc">Shared memory for your AI agents. Orange H monogram on warm charcoal.</desc>
+  <rect width="1280" height="400" fill="#0B0A09"/>
+  <g transform="translate(82 100) scale(1.55)" fill="#FF5C00">
+    <path d="M16 16h28v36L32 64v48H16z"/>
+    <path d="M84 16h28v84l-12 12H84V76l12-12V16z"/>
+    <path d="M48 48h28l16 16-12 12H52L36 60z"/>
+  </g>
+  <text x="318" y="213" fill="#F5F2EC" font-family="Arial, Helvetica, sans-serif" font-size="91" font-weight="900" letter-spacing="-4">HustleMemory</text>
+  <text x="324" y="262" fill="#FFE9C2" font-family="Arial, Helvetica, sans-serif" font-size="27">Shared memory for your AI agents.</text>
+  <path d="M324 294h66" stroke="#FF5C00" stroke-width="5"/>
+</svg>

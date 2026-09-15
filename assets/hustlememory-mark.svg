@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title">
+  <title id="title">HustleMemory — shared context monogram</title>
+  <g fill="#FF5C00">
+    <path d="M16 16h28v36L32 64v48H16z"/>
+    <path d="M84 16h28v84l-12 12H84V76l12-12V16z"/>
+    <path d="M48 48h28l16 16-12 12H52L36 60z"/>
+  </g>
+</svg>

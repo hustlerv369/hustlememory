@@ -1,0 +1,32 @@
+# HustleMemory local stores
+.agent-memory/
+
+# Credentials and environment
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+secrets.json
+*.secret
+
+# Agent/tool local directories
+.claude/
+.grok/
+.codex/
+
+# Logs and caches
+*.log
+logs/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+.DS_Store
+Thumbs.db
