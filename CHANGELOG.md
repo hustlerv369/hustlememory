@@ -6,12 +6,13 @@ Full memory access, plus auto-save. Search and read no longer drop notes, bytes,
 
 ### Removed or disabled limits
 
-- Recall scans every note and every task handoff. There is no file cap and no per-note byte cap inside the in-memory safety ceiling.
-- `read` prints the entire note or handoff. It does not stop at 64 KiB.
-- List, recall, digest, and harness status page with `--limit` and `--offset`. Remaining rows are reported (`more: N more results, use --offset …`). `--limit 0` prints every row. List and status default to every row.
+- Recall scans every note and every task handoff. There is no file cap and no per-note byte cap.
+- `read` prints the entire note or handoff. Search and duplicate checks stream the file, so a large note stays fully searchable.
+- A note of any size is stored in full. The old 256 KiB rejection is gone.
+- List, recall, digest, and harness status page with `--limit` and `--offset`. Every page prints a `more:` line. When rows remain it gives the next offset. When the page is complete it prints `more: 0 more results`. `--limit 0` prints every row. List and status default to every row.
 - Titles are stored in full. The old 120-character title cut is gone.
 - The Grok worker template no longer sets `--max-turns 20` or `--no-subagents`. A saved profile that still has those flags gets a warning.
-- The default harness timeout is 3600 seconds. `--timeout` still accepts 1–86400. On timeout, files already written stay on disk.
+- The harness does not stop a worker on a timer unless `--timeout` is set. Omit it, or pass 0, to wait until the worker exits. There is no maximum. On an opt-in timeout, files already written stay on disk.
 
 ### Retrieval
 
@@ -26,9 +27,9 @@ Full memory access, plus auto-save. Search and read no longer drop notes, bytes,
 
 - `remember` appends a note with author, source, and timestamp. If the same text is already stored (accent- and whitespace-insensitive), it prints the existing id and does not rewrite anything. A different body with the same title becomes a new note with `supersedes`. Explicit `--related` and `--supersedes` links are also new notes; the older notes stay unchanged.
 - `remember` refuses private keys, cloud key ids, common token prefixes, and credential assignments. Nothing is written in that case.
-- When a harness task ends with a non-empty handoff, that handoff is copied into a new note. The handoff file is not edited or deleted. Secrets and files that cannot be stored whole are not copied, and the command says so.
+- When a harness task ends with a non-empty handoff, that handoff is copied into a new note. The copy is streamed, so a long handoff is stored in full. The handoff file is not edited or deleted. A handoff that looks like a secret is not copied, and the command says so. The handoff file stays on disk.
 
 ### Still rejected on purpose
 
-- A new note larger than 256 KiB is rejected and is not stored in part.
-- Search and indexes refuse a single file above 64 MiB instead of returning a partial result. `read` still streams that file in full. The file is not modified.
+- `remember`, and harness capture of a handoff, refuse text that looks like a private key, a cloud key id, a common token prefix, or a credential assignment. Nothing is written in that case. This is a privacy rule, not a size limit.
+- The store marker is still checked for valid JSON, kind, and layout version, so a foreign directory is not treated as a HustleMemory store. Its size is not a reason to refuse it. Layout version stays 1.

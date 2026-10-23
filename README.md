@@ -115,10 +115,11 @@ python <path-to-hustlememory>/scripts/memory.py note --project <root> --title "T
 
 Writes are exclusive-create with unique ids. Existing notes are never
 overwritten or deleted. `list` prints every note unless you pass `--limit`.
-`recall` and `digest` print a page and, when more rows exist, a line of the
-form `more: N more results, use --offset … --limit …`. `--limit 0` prints the
-whole result. A note larger than 256 KiB is rejected and is not stored in part.
-`read` prints the stored file in full.
+`recall` and `digest` print a page. Every page includes a `more:` line. When
+rows remain it has the form `more: N more results, use --offset … --limit …`.
+When the page is complete it says `more: 0 more results`. `--limit 0` prints
+the whole result. Notes are stored in full at any size. `read` prints the
+stored file in full.
 
 ## Delegate a task
 
@@ -132,9 +133,10 @@ python scripts/harness.py run --project /path/to/your/project --task <id> --prof
 The last command is a **dry run**. Verify the local profile and subscription
 account before setting `subscription_confirmed` to true in the project's private
 `.agent-memory/harness.json`. Then add `--execute` when you intend to start a
-real worker. The default timeout is 3600 seconds (`--timeout` can raise it up
-to 86400). When a handoff exists, the harness appends a memory note that points
-at it and includes its text, unless that text looks like a secret. Inspect the
+real worker. The worker is not stopped on a timer unless you pass `--timeout`.
+Omit it, or pass 0, to wait until the worker exits. There is no maximum. When
+a handoff exists, the harness appends a memory note that points at it and
+includes its full text, unless that text looks like a secret. Inspect the
 artifacts and handoff before using `accept`.
 The full [harness guide](references/HARNESS.md) covers states, profiles, and limits.
 

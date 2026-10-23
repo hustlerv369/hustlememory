@@ -58,6 +58,8 @@ class MemoryV2Test(TempProjectTest):
             "MAX_RECALL_RESULTS",
             "MAX_LIST_ENTRIES",
             "MAX_TITLE_CHARS",
+            "MAX_NOTE_BYTES",
+            "SAFETY_READ_BYTES",
             "truncated:",
         ):
             self.assertNotIn(needle, source, needle)
@@ -82,7 +84,7 @@ class MemoryV2Test(TempProjectTest):
         listed = self.cli("list", "--project", str(self.project))
         self.assertEqual(listed.returncode, 0, listed.stderr)
         self.assertIn("showing: 3 of 3", listed.stdout)
-        self.assertNotIn("more:", listed.stdout)
+        self.assertIn("more: 0 more results", listed.stdout)
         self.assertLess(
             listed.stdout.index("20260101T000000Z-newnote1"),
             listed.stdout.index("20230101T000000Z-midnote1"),
@@ -150,7 +152,7 @@ class MemoryV2Test(TempProjectTest):
         )
         self.assertEqual(everything.returncode, 0, everything.stderr)
         self.assertIn("showing: 205 of 205", everything.stdout)
-        self.assertNotIn("more:", everything.stdout)
+        self.assertIn("more: 0 more results", everything.stdout)
         self.assertEqual(everything.stdout.count("\n--- note "), 205)
 
     def test_recall_and_read_include_text_past_the_old_byte_cap(self) -> None:
@@ -182,44 +184,83 @@ class MemoryV2Test(TempProjectTest):
         self.assertIn("x" * 70000, read.stdout)
         self.assertNotIn("truncated:", read.stdout)
 
-    def test_oversized_note_is_rejected_without_a_partial_write(self) -> None:
+    def test_large_note_is_stored_in_full_and_searchable(self) -> None:
         self.init()
-        body = "z" * ((256 * 1024) + 1)
-        result = self.cli("note", "--project", str(self.project), stdin=body)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("not stored", result.stderr)
-        self.assertIn("not shortened", result.stderr)
-        self.assertEqual(list((self.project / ".agent-memory" / "notes").glob("*.md")), [])
+        filler = "z" * (256 * 1024)
+        body = filler + "\nunique-large-tail\n"
+        result = self.cli("note", "--project", str(self.project), "--title", "Large", stdin=body)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        note_id = result.stdout.splitlines()[0].split(" ", 1)[1]
+        path = self.project / ".agent-memory" / "notes" / f"{note_id}.md"
+        self.assertGreater(path.stat().st_size, 256 * 1024)
+        read = self.cli("read", "--project", str(self.project), note_id)
+        self.assertEqual(read.returncode, 0, read.stderr)
+        self.assertIn(filler, read.stdout)
+        self.assertIn("unique-large-tail", read.stdout)
+        found = self.cli("recall", "--project", str(self.project), "unique-large-tail")
+        self.assertEqual(found.returncode, 0, found.stderr)
+        self.assertIn("matches: 1", found.stdout)
+        self.assertIn("preview only, not the full note", found.stdout)
+        self.assertIn(f"full: read {note_id}", found.stdout)
+        again = self.cli(
+            "remember",
+            "--project",
+            str(self.project),
+            "--title",
+            "Large",
+            stdin=body.strip(),
+        )
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertIn("duplicate:", again.stdout)
+        self.assertEqual(len(list((self.project / ".agent-memory" / "notes").glob("*.md"))), 1)
 
-    def test_search_safety_ceiling_does_not_hide_or_alter_the_file(self) -> None:
+    def test_search_reads_any_size_without_changing_the_file(self) -> None:
         self.init()
         note_id = "20260101T000000Z-bigfile1"
         path = self.project / ".agent-memory" / "notes" / f"{note_id}.md"
         path.write_text("unique-big-token\n" + ("x" * 80), encoding="utf-8")
         original = path.read_bytes()
-        previous = memory.SAFETY_READ_BYTES
-        memory.SAFETY_READ_BYTES = 32
+        read_out = io.StringIO()
+        read_err = io.StringIO()
+        with redirect_stdout(read_out), redirect_stderr(read_err):
+            read_code = memory.main(["read", "--project", str(self.project), note_id])
+        self.assertEqual(read_code, 0, read_err.getvalue())
+        self.assertIn("unique-big-token", read_out.getvalue())
+        recall_out = io.StringIO()
+        recall_err = io.StringIO()
+        with redirect_stdout(recall_out), redirect_stderr(recall_err):
+            recall_code = memory.main(
+                ["recall", "--project", str(self.project), "unique-big-token"]
+            )
+        self.assertEqual(recall_code, 0, recall_err.getvalue())
+        self.assertIn("matches: 1", recall_out.getvalue())
+        self.assertIn(note_id, recall_out.getvalue())
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_search_finds_a_token_split_across_read_chunks(self) -> None:
+        self.init()
+        note_id = "20260101T000000Z-chunk01"
+        token = "boundary-token-qq"
+        self.write_raw_note(note_id, "é" + ("a" * 5) + token, title="Chunk")
+        previous = memory.SCAN_CHUNK_BYTES
+        memory.SCAN_CHUNK_BYTES = 1
         try:
-            read_out = io.StringIO()
-            read_err = io.StringIO()
-            with redirect_stdout(read_out), redirect_stderr(read_err):
-                read_code = memory.main(
-                    ["read", "--project", str(self.project), note_id]
-                )
-            self.assertEqual(read_code, 0, read_err.getvalue())
-            self.assertIn("unique-big-token", read_out.getvalue())
-            recall_out = io.StringIO()
-            recall_err = io.StringIO()
-            with redirect_stdout(recall_out), redirect_stderr(recall_err):
-                recall_code = memory.main(
-                    ["recall", "--project", str(self.project), "unique-big-token"]
-                )
-            self.assertNotEqual(recall_code, 0)
-            self.assertNotIn("unique-big-token", recall_out.getvalue())
-            self.assertIn("no partial results", recall_err.getvalue())
-            self.assertEqual(path.read_bytes(), original)
+            out = io.StringIO()
+            err = io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = memory.main(["recall", "--project", str(self.project), token])
+            self.assertEqual(code, 0, err.getvalue())
+            self.assertIn("matches: 1", out.getvalue())
+            self.assertIn(note_id, out.getvalue())
+            accent = io.StringIO()
+            accent_err = io.StringIO()
+            with redirect_stdout(accent), redirect_stderr(accent_err):
+                accent_code = memory.main(["recall", "--project", str(self.project), "eaaaaa"])
+            self.assertEqual(accent_code, 0, accent_err.getvalue())
+            self.assertIn("matches: 1", accent.getvalue())
+            self.assertIn(note_id, accent.getvalue())
         finally:
-            memory.SAFETY_READ_BYTES = previous
+            memory.SCAN_CHUNK_BYTES = previous
 
     def test_accent_insensitive_search_and_single_letter_terms(self) -> None:
         self.init()

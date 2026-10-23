@@ -27,9 +27,6 @@ import memory as mem  # noqa: E402
 
 HARNESS_KIND = "hustlememory-harness"
 HARNESS_VERSION = 1
-DEFAULT_TIMEOUT = 3600
-MIN_TIMEOUT = 1
-MAX_TIMEOUT = 86400
 PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,40}$")
 PLACEHOLDERS = ("prompt_file", "project", "handoff")
 SHELL_SUFFIXES = {".cmd", ".bat", ".ps1", ".sh", ".bash", ".command", ".com"}
@@ -124,8 +121,6 @@ def template_payload() -> dict:
 def load_harness_config(path: Path) -> dict:
     mem.require_regular_file(path, "harness.json")
     raw = path.read_bytes()
-    if len(raw) > 256 * 1024:
-        raise CLIError("harness.json is too large")
     try:
         data = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -237,9 +232,18 @@ def forbidden_env_hits(env: dict[str, str]) -> list[str]:
     return hits
 
 
-def parse_timeout(raw: int) -> int:
-    if raw < MIN_TIMEOUT or raw > MAX_TIMEOUT:
-        raise CLIError(f"timeout must be between {MIN_TIMEOUT} and {MAX_TIMEOUT} seconds")
+def parse_timeout(raw: int | None) -> int | None:
+    """Return seconds to wait, or None when the worker should run without a timer.
+
+    Omit --timeout, or pass 0, to wait until the worker exits. A positive value
+    is an opt-in limit for this run. There is no maximum.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        raise CLIError("--timeout must be zero or greater (0 waits until the worker exits)")
+    if raw == 0:
+        return None
     return raw
 
 
@@ -254,8 +258,6 @@ def status_path(task_dir: Path) -> Path:
 def load_status(path: Path) -> dict:
     mem.require_regular_file(path, "status.json")
     raw = path.read_bytes()
-    if len(raw) > 64 * 1024:
-        raise CLIError("status.json is too large")
     try:
         data = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -296,8 +298,6 @@ def read_description(args: argparse.Namespace, project: Path) -> str:
             raise CLIError("description file is a link or reparse point")
         mem.require_regular_file(path, "description file")
         data = path.read_bytes()
-        if len(data) > mem.MAX_NOTE_BYTES:
-            raise CLIError("description file is too large")
         text = data.decode("utf-8")
     elif args.text:
         text = " ".join(args.text)
@@ -306,8 +306,6 @@ def read_description(args: argparse.Namespace, project: Path) -> str:
     text = text.strip()
     if not text:
         raise CLIError("empty task description")
-    if len(text.encode("utf-8")) > mem.MAX_NOTE_BYTES:
-        raise CLIError("task description is too large")
     return text
 
 
@@ -542,7 +540,7 @@ def cmd_run(
     task_id: str,
     profile_name: str,
     execute: bool,
-    timeout: int,
+    timeout: int | None,
 ) -> int:
     task_id = mem.parse_note_id(task_id)
     timeout = parse_timeout(timeout)
@@ -582,7 +580,8 @@ def cmd_run(
     sys.stdout.write(f"task: {task_id}\n")
     sys.stdout.write(f"profile: {profile_name}\n")
     sys.stdout.write(f"cwd: {project}\n")
-    sys.stdout.write(f"timeout: {timeout}\n")
+    timeout_label = "none" if timeout is None else str(timeout)
+    sys.stdout.write(f"timeout: {timeout_label}\n")
     sys.stdout.write("argv:\n")
     for part in argv:
         sys.stdout.write(f"  {part}\n")
@@ -629,40 +628,29 @@ def capture_handoff_note(project, task_dir, status, profile_name, final_state, h
         if size <= 0:
             sys.stderr.write("hustlememory: handoff is empty; no memory note was written\n")
             return
-        if size > mem.SAFETY_READ_BYTES:
-            sys.stderr.write(
-                "hustlememory: handoff was kept and was not shortened. "
-                f"It is {size} bytes, above the in-memory safety ceiling, so it was not copied into a note.\n"
-            )
-            status["capture"] = "refused"
-            save_status(status_path(task_dir), status)
+        if not mem.file_has_nonwhitespace(handoff):
+            sys.stderr.write("hustlememory: handoff is empty; no memory note was written\n")
             return
-        handoff_text = handoff.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
+    except (OSError, mem.CLIError) as exc:
         sys.stderr.write(f"hustlememory: handoff was kept but not copied into a note ({exc})\n")
-        return
-    if not handoff_text.strip():
-        sys.stderr.write("hustlememory: handoff is empty; no memory note was written\n")
         return
     task_id = str(status.get("id") or task_dir.name)
     title = str(status.get("title") or "Handoff")
-    body = (
+    prefix = (
         f"Task: {task_id}\n"
         f"State: {final_state}\n"
         f"Profile: {profile_name}\n"
         f"Handoff: {mem.MEMORY_DIRNAME}/{mem.TASKS_DIRNAME}/{task_id}/handoff.md\n\n"
-        f"{handoff_text}"
     )
     try:
-        outcome = mem.remember_text(
+        outcome = mem.remember_file(
             project,
             title,
-            body,
+            prefix,
+            handoff,
             ["handoff"],
             profile_name,
             f"handoff:{task_id}",
-            "",
-            [],
         )
     except mem.CLIError as exc:
         sys.stderr.write(
@@ -689,7 +677,7 @@ def capture_handoff_note(project, task_dir, status, profile_name, final_state, h
     save_status(status_path(task_dir), status)
 
 
-def execute_task(project, task_dir, profile_name, argv, timeout, status) -> int:
+def execute_task(project, task_dir, profile_name, argv, timeout: int | None, status) -> int:
     """Called only while holding the task lock, after output-path validation."""
     handoff = task_dir / "handoff.md"
     popen_kw = {"cwd": str(project), "env": os.environ.copy(),
@@ -745,9 +733,9 @@ def execute_task(project, task_dir, profile_name, argv, timeout, status) -> int:
         return mem.EXIT_OK
     if final_state == STATE_TIMEOUT:
         sys.stderr.write(
-            "hustlememory: worker timed out. Files already written were kept and were not "
-            "summarized. Raise --timeout (maximum "
-            f"{MAX_TIMEOUT}) and create a new task to continue.\n"
+            "hustlememory: worker timed out. Files already written were kept. "
+            "Create a new task and pass a larger --timeout, or omit --timeout "
+            "to wait until the worker exits.\n"
         )
         return 124
     if final_state == STATE_INTERRUPTED:
@@ -834,7 +822,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             f"{mem.PRODUCT_NAME} {mem.PRODUCT_LABEL} local CLI harness. --project is required. "
             "run is a dry-run unless --execute is passed. "
-            f"Default timeout is {DEFAULT_TIMEOUT} seconds."
+            "The worker is not stopped on a timer unless --timeout is set."
         ),
     )
     parser.add_argument(
@@ -869,8 +857,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument(
         "--timeout",
         type=int,
-        default=DEFAULT_TIMEOUT,
-        help=f"Seconds before the worker is stopped. Default {DEFAULT_TIMEOUT}. Maximum {MAX_TIMEOUT}.",
+        default=None,
+        help=(
+            "Stop the worker after this many seconds. "
+            "Omit it, or pass 0, to wait until the worker exits."
+        ),
     )
 
     p_status = sub.add_parser("status", parents=[common], help="Show task state, newest first")

@@ -461,18 +461,61 @@ class HarnessTest(unittest.TestCase):
         self.assertNotIn("--no-subagents", templates)
         self.assertIn("BYPASS_FLAGS", source)
 
-    def test_v2_does_not_ship_a_short_worker_cap(self) -> None:
+    def test_v2_does_not_ship_a_worker_timeout_cap(self) -> None:
         scripts = str(REPO_ROOT / "scripts")
         if scripts not in sys.path:
             sys.path.insert(0, scripts)
         import harness
 
-        self.assertEqual(harness.DEFAULT_TIMEOUT, 3600)
-        self.assertEqual(harness.MAX_TIMEOUT, 86400)
+        self.assertFalse(hasattr(harness, "DEFAULT_TIMEOUT"))
+        self.assertFalse(hasattr(harness, "MAX_TIMEOUT"))
+        source = HARNESS.read_text(encoding="utf-8")
+        self.assertNotIn("DEFAULT_TIMEOUT", source)
+        self.assertNotIn("MAX_TIMEOUT", source)
+        self.assertNotIn("86400", source)
         version = self.h("--version")
         self.assertEqual(version.returncode, 0, version.stderr)
         self.assertIn("V2", version.stdout)
         self.assertIn("2.0.0", version.stdout)
+        self.init_and_profiles()
+        task_id = self.create_task()
+        dry = self.h(
+            "run",
+            "--project",
+            str(self.project),
+            "--task",
+            task_id,
+            "--profile",
+            "ok",
+        )
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertIn("timeout: none", dry.stdout)
+        zero = self.h(
+            "run",
+            "--project",
+            str(self.project),
+            "--task",
+            task_id,
+            "--profile",
+            "ok",
+            "--timeout",
+            "0",
+        )
+        self.assertEqual(zero.returncode, 0, zero.stderr)
+        self.assertIn("timeout: none", zero.stdout)
+        negative = self.h(
+            "run",
+            "--project",
+            str(self.project),
+            "--task",
+            task_id,
+            "--profile",
+            "ok",
+            "--timeout",
+            "-1",
+        )
+        self.assertNotEqual(negative.returncode, 0)
+        self.assertIn("zero or greater", negative.stderr)
 
     def test_doctor_warns_when_a_saved_profile_caps_turns(self) -> None:
         result = self.h("init", "--project", str(self.project))

@@ -7,6 +7,8 @@ Every command requires --project pointing at an existing project root.
 from __future__ import annotations
 
 import argparse
+import codecs
+import hashlib
 import json
 import math
 import os
@@ -15,6 +17,7 @@ import secrets
 import sys
 import tempfile
 import unicodedata
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,12 +45,13 @@ GITIGNORE_MEMORY_PATTERNS = (
 )
 NEW_FILE_MODE = 0o600
 
-# Reject an oversized note instead of storing part of it. The file is not written.
-MAX_NOTE_BYTES = 256 * 1024
-# Search and indexes load a file whole so matches cannot hide past a byte cap.
-# Above this ceiling the command stops with an error and returns no partial results.
-# The file is left unchanged. `read` streams the full file with no byte cap.
-SAFETY_READ_BYTES = 64 * 1024 * 1024
+# Search, list, and duplicate checks read files in chunks. A note is never
+# rejected, cut, or skipped because of its size. `read` streams the file in full.
+SCAN_CHUNK_BYTES = 1024 * 1024
+# Secret patterns match within a short window. The overlap keeps a pattern
+# that starts in one chunk and finishes in the next visible to the scanner.
+SECRET_SCAN_OVERLAP = 512
+EXCERPT_LOOKBACK = 80
 # Page size for ranked search and the recent-memory index. CLI --limit 0 prints every row.
 DEFAULT_RECALL_LIMIT = 100
 DEFAULT_DIGEST_LIMIT = 30
@@ -253,13 +257,16 @@ def write_bytes_atomic(path: Path, data: bytes) -> None:
 
 
 def parse_marker(path: Path) -> dict:
+    """Read the store marker. Invalid JSON, kind, or layout version is refused.
+
+    The marker is bookkeeping, not a note. Its size is not a reason to refuse
+    the store, and this function does not shorten the file.
+    """
     require_regular_file(path, "memory marker")
     try:
         raw = path.read_bytes()
     except OSError as exc:
         raise CLIError(f"cannot read memory marker: {exc}") from exc
-    if len(raw) > 4096:
-        raise CLIError("memory marker is malformed")
     try:
         data = json.loads(raw.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -347,7 +354,7 @@ def inspect_uninitialized(memory: Path) -> None:
             if extra:
                 raise CLIError(
                     "refusing to use existing .agent-memory: unrelated files present "
-                    f"({', '.join(extra[:5])})"
+                    f"({', '.join(extra)})"
                 )
             continue
         if entry.name == MARKER_NAME:
@@ -376,7 +383,7 @@ def open_store(project: Path, *, create: bool) -> tuple[Path, Path]:
             if extras:
                 raise CLIError(
                     "refusing to use existing .agent-memory: "
-                    f"{'; '.join(extras[:5])}"
+                    f"{'; '.join(extras)}"
                 )
             notes = notes_dir_for(memory)
             if lexists(notes):
@@ -494,7 +501,12 @@ def note_path(notes: Path, note_id: str) -> Path:
 
 
 def create_note_exclusive(path: Path, data: bytes) -> None:
-    """Write a complete temp file, then publish under a unique name.
+    """Write a complete temp file, then publish under a unique name."""
+    _create_note_exclusive(path, (data,))
+
+
+def _create_note_exclusive(path: Path, chunks: Iterable[bytes]) -> None:
+    """Publish every byte from `chunks`. The destination appears only when complete.
 
     POSIX: os.link of the finished temp makes the destination appear only when
     the bytes are complete (fails if the name exists). Windows: same-directory
@@ -513,7 +525,9 @@ def create_note_exclusive(path: Path, data: bytes) -> None:
     published = False
     try:
         with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
+            for chunk in chunks:
+                if chunk:
+                    handle.write(chunk)
             handle.flush()
             os.fsync(handle.fileno())
         apply_private_mode(tmp)
@@ -554,25 +568,6 @@ def sanitize_title(title: str) -> str:
     return " ".join(title.split())
 
 
-def extract_title(text: str) -> str:
-    lines = text.splitlines()
-    if lines and lines[0].strip() == "---":
-        for line in lines[1:]:
-            if line.strip() == "---":
-                break
-            if line.lower().startswith("title:"):
-                value = line.split(":", 1)[1].strip().strip("\"'")
-                return sanitize_title(value)
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("# "):
-            return sanitize_title(stripped[2:])
-    for line in lines:
-        if line.strip() and not line.strip().startswith("---"):
-            return sanitize_title(line.strip())
-    return ""
-
-
 def iter_note_files(notes: Path) -> list[Path]:
     files: list[Path] = []
     try:
@@ -602,8 +597,14 @@ class Entry:
     created: str
     title: str
     tags: list[str]
-    text: str
     size: int
+    word_count: int
+    term_counts: dict[str, int]
+    body_hash: str
+    body_prefix: str
+    body_prefix_partial: bool
+    match_origin: int = -1
+    match_end: int = -1
     score: float = 0.0
 
 
@@ -612,20 +613,6 @@ def fold_text(text: str) -> str:
     decomposed = unicodedata.normalize("NFKD", text)
     stripped = "".join(char for char in decomposed if unicodedata.category(char) != "Mn")
     return stripped.casefold()
-
-
-def folded_index_map(text: str) -> tuple[str, list[int]]:
-    folded: list[str] = []
-    origins: list[int] = []
-    for index, char in enumerate(text):
-        decomposed = unicodedata.normalize("NFKD", char)
-        for part in decomposed:
-            if unicodedata.category(part) == "Mn":
-                continue
-            for out_char in part.casefold():
-                folded.append(out_char)
-                origins.append(index)
-    return "".join(folded), origins
 
 
 def stamp_from_id(entry_id: str) -> str:
@@ -692,21 +679,6 @@ def parse_tags_field(value: str) -> list[str]:
     return [part.strip() for part in text.split(",") if part.strip()]
 
 
-def split_frontmatter(text: str) -> tuple[dict[str, str], str]:
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != "---":
-        return {}, text
-    meta: dict[str, str] = {}
-    for index, line in enumerate(lines[1:], start=1):
-        if line.strip() == "---":
-            return meta, "\n".join(lines[index + 1 :])
-        if ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        meta[key.strip().lower()] = value.strip()
-    return meta, text
-
-
 def query_tokens(query: str) -> list[str]:
     tokens: list[str] = []
     seen: set[str] = set()
@@ -721,60 +693,8 @@ def query_tokens(query: str) -> list[str]:
     return tokens
 
 
-def term_count(folded: str, token: str) -> int:
-    if not token:
-        return 0
-    if len(token) == 1:
-        pattern = rf"(?<!\w){re.escape(token)}(?!\w)"
-        return len(re.findall(pattern, folded))
-    count = 0
-    start = 0
-    step = len(token)
-    while True:
-        found = folded.find(token, start)
-        if found < 0:
-            return count
-        count += 1
-        start = found + step
-
-
-def first_match_span(folded: str, token: str) -> tuple[int, int] | None:
-    if not token:
-        return None
-    if len(token) == 1:
-        found = re.search(rf"(?<!\w){re.escape(token)}(?!\w)", folded)
-        if not found:
-            return None
-        return found.start(), found.end()
-    found_at = folded.find(token)
-    if found_at < 0:
-        return None
-    return found_at, found_at + len(token)
-
-
-def snippet_for(text: str, tokens: list[str], limit: int) -> str:
-    """Short preview around the first hit. The stored file is not modified."""
-    folded, origins = folded_index_map(text)
-    match_at = -1
-    match_len = 0
-    for token in tokens:
-        span = first_match_span(folded, token)
-        if span is not None and (match_at == -1 or span[0] < match_at):
-            match_at = span[0]
-            match_len = span[1] - span[0]
-    if match_at < 0 or not origins:
-        window = text[:limit]
-        partial = len(text) > len(window)
-    else:
-        origin = origins[match_at]
-        end_index = min(len(origins) - 1, match_at + max(match_len, 1) - 1)
-        end_origin = origins[end_index] + 1
-        start = max(0, origin - 80)
-        end = min(len(text), max(end_origin, start + limit))
-        if end - start > limit:
-            end = start + limit
-        window = text[start:end]
-        partial = start > 0 or end < len(text)
+def finish_snippet(window: str, partial: bool) -> str:
+    """Collapse a preview window for display. The stored file is not modified."""
     chunk = " ".join(window.split())
     if partial and chunk and not chunk.endswith("…"):
         chunk = chunk.rstrip() + "…"
@@ -811,26 +731,507 @@ def write_page_status(total: int, offset: int, shown: int, limit: int) -> None:
         message = (
             f"more: {remaining} more results, use --offset {offset + shown} --limit {next_limit}"
         )
-        sys.stdout.write(message + "\n")
-        sys.stderr.write(f"hustlememory: {message}\n")
+    else:
+        message = "more: 0 more results"
+    sys.stdout.write(message + "\n")
+    sys.stderr.write(f"hustlememory: {message}\n")
 
 
-def read_memory_text(path: Path) -> tuple[str, int]:
+def _fold_one(char: str) -> str:
+    """Fold one code point the same way `fold_text` folds a whole string."""
+    decomposed = unicodedata.normalize("NFKD", char)
+    parts: list[str] = []
+    for part in decomposed:
+        if unicodedata.category(part) == "Mn":
+            continue
+        parts.append(part.casefold())
+    return "".join(parts)
+
+
+def _is_word_char(char: str) -> bool:
+    return bool(WORD_RE.fullmatch(char))
+
+
+_LINE_BREAKS = frozenset("\n\v\f\x1c\x1d\x1e\x85\u2028\u2029")
+
+
+class NormalizedHasher:
+    """SHA-256 of `normalized_memory_text` without keeping the text."""
+
+    def __init__(self) -> None:
+        self._sha = hashlib.sha256()
+        self._started = False
+        self._pending_space = False
+
+    def feed(self, text: str) -> None:
+        for char in text:
+            for out in _fold_one(char):
+                if out.isspace():
+                    if self._started:
+                        self._pending_space = True
+                    continue
+                if self._pending_space:
+                    self._sha.update(b" ")
+                    self._pending_space = False
+                self._started = True
+                self._sha.update(out.encode("utf-8"))
+
+    def hexdigest(self) -> str:
+        return self._sha.hexdigest()
+
+
+def normalized_body_hash(text: str) -> str:
+    hasher = NormalizedHasher()
+    hasher.feed(text)
+    return hasher.hexdigest()
+
+
+class _TermStats:
+    """BM25 term counts and the first match location, over a folded stream."""
+
+    def __init__(self, tokens: list[str]) -> None:
+        self.counts = {token: 0 for token in tokens}
+        self.word_count = 0
+        self._in_word = False
+        self._multi = [token for token in tokens if len(token) != 1]
+        self._ones = [token for token in tokens if len(token) == 1]
+        self._carry = {token: "" for token in self._multi}
+        self._carry_origins: dict[str, list[int]] = {token: [] for token in self._multi}
+        self._hold: str | None = None
+        self._hold_origin = -1
+        self._hold_prev_word = False
+        self._folded_len = 0
+        self.match_at = -1
+        self.match_origin = -1
+        self.match_end = -1
+        self._char_index = 0
+
+    def feed(self, text: str) -> None:
+        if not text:
+            return
+        folded_chars: list[str] = []
+        origins: list[int] = []
+        for offset, char in enumerate(text):
+            folded = _fold_one(char)
+            origin = self._char_index + offset
+            for out_char in folded:
+                folded_chars.append(out_char)
+                origins.append(origin)
+                if _is_word_char(out_char):
+                    self._in_word = True
+                elif self._in_word:
+                    self.word_count += 1
+                    self._in_word = False
+        self._char_index += len(text)
+        folded = "".join(folded_chars)
+        if self._multi:
+            self._search_multi(folded, origins)
+        if self._ones:
+            self._search_ones(folded, origins)
+        self._folded_len += len(folded)
+
+    def finish(self) -> None:
+        if self._in_word:
+            self.word_count += 1
+            self._in_word = False
+        if self._hold is not None and self._ones:
+            self._count_one(self._hold, self._hold_prev_word, False, self._hold_origin, self._folded_len - 1)
+            self._hold = None
+
+    def _consider(self, folded_at: int, origin: int, end_origin: int) -> None:
+        if self.match_at != -1 and folded_at >= self.match_at:
+            return
+        self.match_at = folded_at
+        self.match_origin = origin
+        self.match_end = end_origin
+
+    def _search_multi(self, folded: str, origins: list[int]) -> None:
+        for token in self._multi:
+            old = self._carry[token]
+            text = old + folded
+            all_origins = self._carry_origins[token] + origins
+            base = self._folded_len - len(old)
+            start = 0
+            step = len(token)
+            while True:
+                found = text.find(token, start)
+                if found < 0:
+                    break
+                self.counts[token] += 1
+                end_local = found + step - 1
+                self._consider(base + found, all_origins[found], all_origins[end_local] + 1)
+                start = found + step
+            tail_start = max(start, len(text) - (step - 1))
+            self._carry[token] = text[tail_start:]
+            self._carry_origins[token] = all_origins[tail_start:]
+
+    def _search_ones(self, folded: str, origins: list[int]) -> None:
+        if self._hold is None:
+            data = folded
+            data_origins = origins
+            base = self._folded_len
+        else:
+            data = self._hold + folded
+            data_origins = [self._hold_origin, *origins]
+            base = self._folded_len - 1
+        if not data:
+            return
+        for index in range(len(data) - 1):
+            if index == 0 and self._hold is not None:
+                prev_word = self._hold_prev_word
+            elif index == 0:
+                prev_word = False
+            else:
+                prev_word = _is_word_char(data[index - 1])
+            self._count_one(
+                data[index],
+                prev_word,
+                _is_word_char(data[index + 1]),
+                data_origins[index],
+                base + index,
+            )
+        self._hold = data[-1]
+        self._hold_origin = data_origins[-1]
+        if len(data) >= 2:
+            self._hold_prev_word = _is_word_char(data[-2])
+        elif self._hold is not None and base == self._folded_len:
+            self._hold_prev_word = False
+
+    def _count_one(
+        self,
+        char: str,
+        prev_word: bool,
+        next_word: bool,
+        origin: int,
+        folded_at: int,
+    ) -> None:
+        if prev_word or next_word:
+            return
+        for token in self._ones:
+            if char != token:
+                continue
+            self.counts[token] += 1
+            self._consider(folded_at, origin, origin + 1)
+
+
+class _FileScan:
+    """One streaming pass: metadata, body hash, digest prefix, and term stats."""
+
+    def __init__(self) -> None:
+        self.meta: dict[str, str] = {}
+        self._full_hash = NormalizedHasher()
+        self._body_hash = NormalizedHasher()
+        self._mode = "start"
+        self._started_fm = False
+        self._fm_closed = False
+        self._line: list[str] = []
+        self._saw_cr = False
+        self._fm_title: str | None = None
+        self._heading: str | None = None
+        self._fallback: str | None = None
+        self._title_line: list[str] = []
+        self._prefix: list[str] = []
+        self._prefix_len = 0
+        self._prefix_open = True
+        self._body_partial = False
+        self._at_line_start = True
+        self._lines_emitted = 0
+        self._all_prefix: list[str] = []
+        self._all_len = 0
+        self._all_open = True
+        self._all_partial = False
+        self._all_at_start = True
+        self._all_lines = 0
+
+    def feed(self, text: str) -> None:
+        for char in text:
+            self._feed_char(char)
+
+    def finish(self) -> None:
+        if self._mode != "body" and self._line:
+            self._emit_line()
+        if self._title_line:
+            self._capture_line("".join(self._title_line), in_frontmatter=False)
+            self._title_line = []
+
+    def body_hash(self) -> str:
+        if self._fm_closed:
+            return self._body_hash.hexdigest()
+        return self._full_hash.hexdigest()
+
+    def prefix(self) -> tuple[str, bool]:
+        # A closed front matter block is not part of the body. Otherwise the
+        # body is the whole file.
+        if self._fm_closed:
+            partial = self._body_partial or self._prefix_len > DIGEST_EXCERPT_CHARS
+            return "".join(self._prefix), partial
+        partial = self._all_partial or self._all_len > DIGEST_EXCERPT_CHARS
+        return "".join(self._all_prefix), partial
+
+    def title(self, entry_id: str) -> str:
+        meta_title = unquote_yaml(self.meta["title"]) if "title" in self.meta else ""
+        if meta_title:
+            return meta_title
+        if self._started_fm and self._fm_title:
+            return self._fm_title
+        if self._heading:
+            return self._heading
+        if self._fallback:
+            return self._fallback
+        return entry_id
+
+    def _title_resolved(self) -> bool:
+        if self.meta.get("title", "").strip():
+            return True
+        if self._started_fm and self._fm_title:
+            return True
+        if self._heading or self._fallback:
+            return True
+        return False
+
+    def _feed_char(self, char: str) -> None:
+        self._full_hash.feed(char)
+        is_break, skipped_lf = self._classify_break(char)
+        self._note_stream(is_break, skipped_lf, char)
+        if skipped_lf:
+            if self._mode == "body":
+                self._body_hash.feed(char)
+            return
+        if self._mode == "body":
+            self._body_hash.feed(char)
+            if is_break:
+                self._on_body_break()
+            else:
+                self._on_body_char(char)
+            return
+        if is_break:
+            self._emit_line()
+            return
+        self._line.append(char)
+        if self._mode == "start" and len(self._line) >= 3 and "".join(self._line[:3]) != "---":
+            buffered = "".join(self._line)
+            self._line = []
+            self._mode = "body"
+            for item in buffered:
+                self._body_hash.feed(item)
+                self._on_body_char(item)
+
+    def _classify_break(self, char: str) -> tuple[bool, bool]:
+        if self._saw_cr:
+            self._saw_cr = False
+            if char == "\n":
+                return False, True
+        if char == "\r":
+            self._saw_cr = True
+            return True, False
+        if char in _LINE_BREAKS:
+            return True, False
+        return False, False
+
+    def _emit_line(self) -> None:
+        line = "".join(self._line)
+        self._line = []
+        if self._mode == "start":
+            if line.strip() == "---":
+                self._mode = "fm"
+                self._started_fm = True
+                self._capture_line(line, in_frontmatter=True)
+                return
+            self._mode = "body"
+            self._capture_line(line, in_frontmatter=False)
+            for item in line:
+                self._body_hash.feed(item)
+                self._on_body_char(item)
+            return
+        if self._mode == "fm":
+            if line.strip() == "---":
+                self._capture_line(line, in_frontmatter=True)
+                self._mode = "body"
+                self._fm_closed = True
+                self._at_line_start = True
+                self._lines_emitted = 0
+                return
+            self._read_meta(line)
+            return
+        self._capture_line(line, in_frontmatter=False)
+
+    def _read_meta(self, line: str) -> None:
+        self._capture_line(line, in_frontmatter=True)
+        if ":" not in line:
+            return
+        key, value = line.split(":", 1)
+        self.meta[key.strip().lower()] = value.strip()
+
+    def _capture_line(self, line: str, *, in_frontmatter: bool) -> None:
+        if in_frontmatter and self._fm_title is None and line.lower().startswith("title:"):
+            value = line.split(":", 1)[1].strip().strip("\"'")
+            self._fm_title = sanitize_title(value)
+        stripped = line.strip()
+        if self._heading is None and stripped.startswith("# "):
+            self._heading = sanitize_title(stripped[2:])
+        if self._fallback is None and stripped and not stripped.startswith("---"):
+            self._fallback = sanitize_title(stripped)
+
+    def _push_all(self, text: str) -> None:
+        if not text:
+            return
+        if not self._all_open:
+            self._all_partial = True
+            return
+        for char in text:
+            if self._all_len >= DIGEST_EXCERPT_CHARS + 1:
+                self._all_open = False
+                self._all_partial = True
+                return
+            self._all_prefix.append(char)
+            self._all_len += 1
+
+    def _note_stream(self, is_break: bool, skipped_lf: bool, char: str) -> None:
+        """Track the splitlines-joined text of the whole file for digest previews."""
+        if skipped_lf:
+            return
+        if is_break:
+            if self._all_at_start:
+                if self._all_lines > 0:
+                    self._push_all("\n")
+                self._all_lines += 1
+                return
+            self._all_lines += 1
+            self._all_at_start = True
+            return
+        if self._all_at_start:
+            if self._all_lines > 0:
+                self._push_all("\n")
+            self._all_at_start = False
+        self._push_all(char)
+
+    def _push_prefix(self, text: str) -> None:
+        if not text:
+            return
+        if not self._prefix_open:
+            self._body_partial = True
+            return
+        for char in text:
+            if self._prefix_len >= DIGEST_EXCERPT_CHARS + 1:
+                self._prefix_open = False
+                self._body_partial = True
+                return
+            self._prefix.append(char)
+            self._prefix_len += 1
+
+    def _on_body_char(self, char: str) -> None:
+        if self._at_line_start:
+            if self._lines_emitted > 0:
+                self._push_prefix("\n")
+            self._at_line_start = False
+        self._push_prefix(char)
+        if not self._title_resolved():
+            self._title_line.append(char)
+
+    def _on_body_break(self) -> None:
+        if self._title_line:
+            self._capture_line("".join(self._title_line), in_frontmatter=False)
+            self._title_line = []
+        if self._at_line_start:
+            if self._lines_emitted > 0:
+                self._push_prefix("\n")
+            self._lines_emitted += 1
+            return
+        self._lines_emitted += 1
+        self._at_line_start = True
+
+
+def iter_decoded_text(path: Path) -> Iterator[str]:
+    """Yield decoded text in chunks. Incomplete UTF-8 sequences stay in the decoder."""
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    try:
+        with path.open("rb") as handle:
+            while True:
+                raw = handle.read(SCAN_CHUNK_BYTES)
+                if not raw:
+                    tail = decoder.decode(b"", final=True)
+                    if tail:
+                        yield tail
+                    return
+                text = decoder.decode(raw, final=False)
+                if text:
+                    yield text
+    except OSError as exc:
+        raise CLIError(f"cannot read {path.name}: {exc}") from exc
+
+
+def file_has_nonwhitespace(path: Path) -> bool:
+    for chunk in iter_decoded_text(path):
+        if chunk.strip():
+            return True
+    return False
+
+
+def read_char_window(path: Path, start: int, length: int) -> tuple[str, bool]:
+    """Return `length` decoded characters from `start`, and whether any follow them."""
+    if length < 0:
+        length = 0
+    seen = 0
+    out: list[str] = []
+    for chunk in iter_decoded_text(path):
+        for char in chunk:
+            if seen >= start + length:
+                return "".join(out), True
+            if seen >= start:
+                out.append(char)
+            seen += 1
+    return "".join(out), False
+
+
+def snippet_from_match(path: Path, origin: int, end_origin: int, limit: int) -> str:
+    """Preview around the first match. The stored file is not modified."""
+    if origin < 0:
+        window, more = read_char_window(path, 0, limit)
+        return finish_snippet(window, more)
+    start = max(0, origin - EXCERPT_LOOKBACK)
+    end = max(end_origin, start + limit)
+    if end - start > limit:
+        end = start + limit
+    window, more = read_char_window(path, start, end - start)
+    return finish_snippet(window, start > 0 or more)
+
+
+def digest_snippet(prefix: str, partial: bool) -> str:
+    window = prefix[:DIGEST_EXCERPT_CHARS]
+    is_partial = partial or len(prefix) > DIGEST_EXCERPT_CHARS
+    return finish_snippet(window, is_partial)
+
+
+def scan_entry(kind: str, entry_id: str, path: Path, tokens: list[str]) -> Entry:
     try:
         size = path.stat().st_size
     except OSError as exc:
         raise CLIError(f"cannot read {path.name}: {exc}") from exc
-    if size > SAFETY_READ_BYTES:
-        raise CLIError(
-            f"{path} is {size} bytes, above the {SAFETY_READ_BYTES}-byte safety ceiling. "
-            "It was not modified or shortened, and this command returned no partial results. "
-            "Read the file from disk."
-        )
-    try:
-        data = path.read_bytes()
-    except OSError as exc:
-        raise CLIError(f"cannot read {path.name}: {exc}") from exc
-    return data.decode("utf-8", errors="replace"), size
+    parser = _FileScan()
+    stats = _TermStats(tokens)
+    for chunk in iter_decoded_text(path):
+        parser.feed(chunk)
+        stats.feed(chunk)
+    parser.finish()
+    stats.finish()
+    prefix, partial = parser.prefix()
+    created = parser.meta.get("created", "") or stamp_from_id(entry_id)
+    return Entry(
+        kind=kind,
+        entry_id=entry_id,
+        path=path,
+        created=created,
+        title=parser.title(entry_id),
+        tags=parse_tags_field(parser.meta.get("tags", "")),
+        size=size,
+        word_count=stats.word_count,
+        term_counts=stats.counts,
+        body_hash=parser.body_hash(),
+        body_prefix=prefix,
+        body_prefix_partial=partial,
+        match_origin=stats.match_origin,
+        match_end=stats.match_end,
+    )
 
 
 def stream_file(path: Path) -> None:
@@ -848,24 +1249,6 @@ def stream_file(path: Path) -> None:
         raise CLIError(f"cannot read {path.name}: {exc}") from exc
     if not ended_with_newline:
         sys.stdout.write("\n")
-
-
-def entry_from_file(kind: str, entry_id: str, path: Path) -> Entry:
-    text, size = read_memory_text(path)
-    meta, _body = split_frontmatter(text)
-    title = unquote_yaml(meta.get("title", "")) or extract_title(text) or entry_id
-    created = meta.get("created", "") or stamp_from_id(entry_id)
-    tags = parse_tags_field(meta.get("tags", ""))
-    return Entry(
-        kind=kind,
-        entry_id=entry_id,
-        path=path,
-        created=created,
-        title=title,
-        tags=tags,
-        text=text,
-        size=size,
-    )
 
 
 def iter_handoff_files(tasks: Path) -> list[Path]:
@@ -901,7 +1284,7 @@ def iter_handoff_files(tasks: Path) -> list[Path]:
     return files
 
 
-def load_entries(notes: Path, tasks: Path, source: str) -> list[Entry]:
+def load_entries(notes: Path, tasks: Path, source: str, tokens: list[str]) -> list[Entry]:
     if source == "notes":
         kinds = ("note",)
     elif source == "handoffs":
@@ -913,10 +1296,10 @@ def load_entries(notes: Path, tasks: Path, source: str) -> list[Entry]:
     entries: list[Entry] = []
     if "note" in kinds:
         for path in iter_note_files(notes):
-            entries.append(entry_from_file("note", path.stem, path))
+            entries.append(scan_entry("note", path.stem, path, tokens))
     if "handoff" in kinds:
         for path in iter_handoff_files(tasks):
-            entries.append(entry_from_file("handoff", path.parent.name, path))
+            entries.append(scan_entry("handoff", path.parent.name, path, tokens))
     return entries
 
 
@@ -934,24 +1317,23 @@ def filter_tags(entries: list[Entry], tags: list[str]) -> list[Entry]:
 
 
 def score_entries(entries: list[Entry], tokens: list[str]) -> list[Entry]:
-    folded_docs = [fold_text(entry.text) for entry in entries]
-    lengths = [max(1, len(WORD_RE.findall(text))) for text in folded_docs]
-    counts = [{token: term_count(text, token) for token in tokens} for text in folded_docs]
     total_docs = len(entries)
     if total_docs == 0:
         return []
+    lengths = [max(1, entry.word_count) for entry in entries]
     average_length = sum(lengths) / total_docs
     idf: dict[str, float] = {}
     for token in tokens:
-        document_frequency = sum(1 for row in counts if row[token] > 0)
+        document_frequency = sum(1 for entry in entries if entry.term_counts.get(token, 0) > 0)
         idf[token] = math.log(1.0 + (total_docs - document_frequency + 0.5) / (document_frequency + 0.5))
     ranked: list[Entry] = []
-    for entry, length, row in zip(entries, lengths, counts):
-        if all(value <= 0 for value in row.values()):
+    for entry, length in zip(entries, lengths):
+        row = entry.term_counts
+        if all(row.get(token, 0) <= 0 for token in tokens):
             continue
         score = 0.0
         for token in tokens:
-            frequency = row[token]
+            frequency = row.get(token, 0)
             if frequency <= 0:
                 continue
             denominator = frequency + BM25_K1 * (
@@ -993,7 +1375,8 @@ def write_match(entry: Entry, tokens: list[str], excerpt_limit: int) -> None:
         f"created={entry.created}  tags={format_tags(entry.tags)}\n"
     )
     sys.stdout.write(f"title: {entry.title}\n")
-    sys.stdout.write(f"excerpt: {snippet_for(entry.text, tokens, excerpt_limit)}\n")
+    preview = snippet_from_match(entry.path, entry.match_origin, entry.match_end, excerpt_limit)
+    sys.stdout.write(f"excerpt: preview only, not the full note: {preview}\n")
     sys.stdout.write(f"full: {read_hint(entry)}\n")
 
 
@@ -1038,7 +1421,7 @@ def cmd_list(
 ) -> int:
     offset, limit = parse_page(offset, limit)
     memory, notes = open_store(project, create=False)
-    entries = filter_tags(load_entries(notes, tasks_dir_for(memory), source), tags)
+    entries = filter_tags(load_entries(notes, tasks_dir_for(memory), source, []), tags)
     sort_newest(entries)
     page = slice_page(entries, offset, limit)
     sys.stdout.write(f"project: {project}\n")
@@ -1066,7 +1449,7 @@ def cmd_recall(
         raise CLIError("query has no usable terms")
     offset, limit = parse_page(offset, limit)
     memory, notes = open_store(project, create=False)
-    loaded = load_entries(notes, tasks_dir_for(memory), source)
+    loaded = load_entries(notes, tasks_dir_for(memory), source, tokens)
     entries = filter_tags(loaded, tags)
     ranked = score_entries(entries, tokens)
     page = slice_page(ranked, offset, limit)
@@ -1095,7 +1478,7 @@ def cmd_digest(
 ) -> int:
     offset, limit = parse_page(offset, limit)
     memory, notes = open_store(project, create=False)
-    loaded = load_entries(notes, tasks_dir_for(memory), source)
+    loaded = load_entries(notes, tasks_dir_for(memory), source, [])
     entries = filter_tags(loaded, tags)
     sort_newest(entries)
     page = slice_page(entries, offset, limit)
@@ -1110,13 +1493,13 @@ def cmd_digest(
         "note: excerpts are previews; use the full command to read the stored text\n"
     )
     for entry in page:
-        _meta, body = split_frontmatter(entry.text)
         sys.stdout.write(
             f"--- {entry.kind} {entry.entry_id}  created={entry.created}  "
             f"tags={format_tags(entry.tags)}\n"
         )
         sys.stdout.write(f"title: {entry.title}\n")
-        sys.stdout.write(f"excerpt: {snippet_for(body, [], DIGEST_EXCERPT_CHARS)}\n")
+        preview = digest_snippet(entry.body_prefix, entry.body_prefix_partial)
+        sys.stdout.write(f"excerpt: preview only, not the full note: {preview}\n")
         sys.stdout.write(f"full: {read_hint(entry)}\n")
     write_page_status(len(entries), offset, len(page), limit)
     return EXIT_OK
@@ -1159,7 +1542,7 @@ class StoredNote:
     note_id: str
     title: str
     created: str
-    body: str
+    body_hash: str
 
 
 @dataclass
@@ -1221,14 +1604,14 @@ def resolve_author(explicit: str) -> str:
     return parse_provenance_label(text, "author", "unknown")
 
 
-def render_note(
+def render_note_head(
     note_id: str,
     heading: str,
     created: str,
     tags: list[str],
-    text: str,
     extra_lines: list[str],
 ) -> str:
+    """Front matter and the blank line before the body. The body is appended after this."""
     lines = [
         "---",
         f"id: {note_id}",
@@ -1238,17 +1621,38 @@ def render_note(
     if tags:
         lines.append("tags: " + json.dumps(tags, ensure_ascii=False))
     lines.extend(extra_lines)
-    lines.extend(["---", "", text])
+    lines.extend(["---", ""])
     return "\n".join(lines) + "\n"
 
 
-def reject_oversized_body(text: str) -> None:
-    encoded_len = len(text.encode("utf-8"))
-    if encoded_len > MAX_NOTE_BYTES:
-        raise CLIError(
-            f"note exceeds {MAX_NOTE_BYTES} bytes ({encoded_len} bytes). "
-            "It was not stored and was not shortened. Split it into more than one note."
-        )
+def render_note(
+    note_id: str,
+    heading: str,
+    created: str,
+    tags: list[str],
+    text: str,
+    extra_lines: list[str],
+) -> str:
+    return render_note_head(note_id, heading, created, tags, extra_lines) + text + "\n"
+
+
+def publish_new_note(notes: Path, chunk_factory: Callable[[str], Iterable[bytes]]) -> str:
+    """Append one new note. `chunk_factory` is called again if the id collides."""
+    last_error: Exception | None = None
+    for _ in range(8):
+        note_id = new_note_id()
+        path = note_path(notes, note_id)
+        if not is_inside(path, notes):
+            raise CLIError("note path escapes the selected project")
+        try:
+            _create_note_exclusive(path, chunk_factory(note_id))
+        except FileExistsError as exc:
+            last_error = exc
+            continue
+        except OSError as exc:
+            raise CLIError(f"cannot write note: {exc}") from exc
+        return note_id
+    raise CLIError(f"could not allocate a unique note id: {last_error}")
 
 
 def write_new_note(
@@ -1259,32 +1663,19 @@ def write_new_note(
     extra_lines: list[str],
 ) -> str:
     created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    last_error: Exception | None = None
-    for _ in range(8):
-        note_id = new_note_id()
-        path = note_path(notes, note_id)
-        if not is_inside(path, notes):
-            raise CLIError("note path escapes the selected project")
+
+    def factory(note_id: str) -> Iterable[bytes]:
         content = render_note(note_id, heading, created, tags, text, extra_lines)
-        try:
-            create_note_exclusive(path, content.encode("utf-8"))
-        except FileExistsError as exc:
-            last_error = exc
-            continue
-        except OSError as exc:
-            raise CLIError(f"cannot write note: {exc}") from exc
-        return note_id
-    raise CLIError(f"could not allocate a unique note id: {last_error}")
+        return (content.encode("utf-8"),)
+
+    return publish_new_note(notes, factory)
 
 
 def load_stored_notes(notes: Path) -> list[StoredNote]:
     stored: list[StoredNote] = []
     for path in iter_note_files(notes):
-        text, _size = read_memory_text(path)
-        meta, body = split_frontmatter(text)
-        title = unquote_yaml(meta.get("title", "")) or extract_title(text) or path.stem
-        created = meta.get("created", "") or stamp_from_id(path.stem)
-        stored.append(StoredNote(path.stem, title, created, body))
+        entry = scan_entry("note", path.stem, path, [])
+        stored.append(StoredNote(entry.entry_id, entry.title, entry.created, entry.body_hash))
     return stored
 
 
@@ -1296,6 +1687,51 @@ def require_existing_note(notes: Path, raw_id: str) -> str:
     require_regular_file(path, "note")
     require_inside(path, notes, "note")
     return note_id
+
+
+def plan_remember(
+    stored: list[StoredNote],
+    heading: str,
+    wanted_hash: str,
+    explicit_supersedes: str,
+    explicit_related: list[str],
+) -> tuple[RememberOutcome | None, str, list[str]]:
+    """Decide duplicate, supersedes, and related ids. Nothing is written here."""
+    title_key = fold_text(heading)
+    duplicates = [item.note_id for item in stored if item.body_hash == wanted_hash]
+    if duplicates:
+        known_titles = {
+            fold_text(item.title)
+            for item in stored
+            if item.note_id in set(duplicates)
+        }
+        if not title_key or title_key in known_titles:
+            duplicates.sort(reverse=True)
+            return RememberOutcome("duplicate", duplicates), "", []
+    same_title = [item for item in stored if title_key and fold_text(item.title) == title_key]
+    same_title.sort(key=lambda item: (item.created, item.note_id), reverse=True)
+    same_ids = [item.note_id for item in same_title]
+    chosen_supersedes = explicit_supersedes or (same_ids[0] if same_ids else "")
+    linked: list[str] = []
+    seen: set[str] = set()
+    for note_id in [*explicit_related, *same_ids, *duplicates]:
+        if not note_id or note_id == chosen_supersedes or note_id in seen:
+            continue
+        seen.add(note_id)
+        linked.append(note_id)
+    return None, chosen_supersedes, linked
+
+
+def provenance_lines(author_label: str, origin_label: str, supersedes: str, linked: list[str]) -> list[str]:
+    extra = [
+        f"author: {yaml_quote(author_label)}",
+        f"source: {yaml_quote(origin_label)}",
+    ]
+    if supersedes:
+        extra.append(f"supersedes: {supersedes}")
+    if linked:
+        extra.append("related: " + json.dumps(linked, ensure_ascii=False))
+    return extra
 
 
 def remember_text(
@@ -1312,7 +1748,6 @@ def remember_text(
     text = body.strip()
     if not text:
         raise CLIError("empty note body (pass text arguments or stdin)")
-    reject_oversized_body(text)
     heading = sanitize_title(title) or sanitize_title(text.splitlines()[0]) or "Note"
     refuse_secrets(heading, text)
     author_label = resolve_author(author)
@@ -1322,46 +1757,93 @@ def remember_text(
     explicit_supersedes = require_existing_note(notes, supersedes) if supersedes.strip() else ""
     explicit_related = [require_existing_note(notes, item) for item in related]
     stored = load_stored_notes(notes)
-    wanted = normalized_memory_text(text)
-    title_key = fold_text(heading)
-    duplicates = [
-        item.note_id
-        for item in stored
-        if normalized_memory_text(item.body) == wanted
-    ]
-    if duplicates:
-        known_titles = {
-            fold_text(item.title)
-            for item in stored
-            if item.note_id in set(duplicates)
-        }
-        if not title_key or title_key in known_titles:
-            duplicates.sort(reverse=True)
-            return RememberOutcome("duplicate", duplicates)
-    same_title = [
-        item
-        for item in stored
-        if title_key and fold_text(item.title) == title_key
-    ]
-    same_title.sort(key=lambda item: (item.created, item.note_id), reverse=True)
-    same_ids = [item.note_id for item in same_title]
-    chosen_supersedes = explicit_supersedes or (same_ids[0] if same_ids else "")
-    linked: list[str] = []
-    seen: set[str] = set()
-    for note_id in [*explicit_related, *same_ids, *duplicates]:
-        if not note_id or note_id == chosen_supersedes or note_id in seen:
-            continue
-        seen.add(note_id)
-        linked.append(note_id)
-    extra = [
-        f"author: {yaml_quote(author_label)}",
-        f"source: {yaml_quote(origin_label)}",
-    ]
-    if chosen_supersedes:
-        extra.append(f"supersedes: {chosen_supersedes}")
-    if linked:
-        extra.append("related: " + json.dumps(linked, ensure_ascii=False))
+    duplicate, chosen_supersedes, linked = plan_remember(
+        stored,
+        heading,
+        normalized_body_hash(text),
+        explicit_supersedes,
+        explicit_related,
+    )
+    if duplicate is not None:
+        return duplicate
+    extra = provenance_lines(author_label, origin_label, chosen_supersedes, linked)
     note_id = write_new_note(notes, heading, text, chosen_tags, extra)
+    return RememberOutcome("wrote", [note_id], chosen_supersedes, linked)
+
+
+def inspect_prefixed_file(path: Path, prefix: str) -> tuple[str | None, str]:
+    """Scan a file once for secrets and the normalized hash of prefix + file text."""
+    hasher = NormalizedHasher()
+    hasher.feed(prefix)
+    tail = prefix
+    label = secret_label(prefix)
+    for chunk in iter_decoded_text(path):
+        hasher.feed(chunk)
+        if label is None:
+            window = tail + chunk
+            label = secret_label(window)
+            if len(window) > SECRET_SCAN_OVERLAP:
+                tail = window[-SECRET_SCAN_OVERLAP:]
+            else:
+                tail = window
+    return label, hasher.hexdigest()
+
+
+def iter_decoded_bytes(path: Path) -> Iterator[bytes]:
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    try:
+        with path.open("rb") as handle:
+            while True:
+                raw = handle.read(SCAN_CHUNK_BYTES)
+                if not raw:
+                    tail = decoder.decode(b"", final=True)
+                    if tail:
+                        yield tail.encode("utf-8")
+                    return
+                text = decoder.decode(raw, final=False)
+                if text:
+                    yield text.encode("utf-8")
+    except OSError as exc:
+        raise CLIError(f"cannot read {path.name}: {exc}") from exc
+
+
+def remember_file(
+    project: Path,
+    title: str,
+    prefix: str,
+    source: Path,
+    tags: list[str],
+    author: str,
+    origin: str,
+) -> RememberOutcome:
+    """Append prefix + the full file as a new note. The source file is not edited."""
+    label, wanted = inspect_prefixed_file(source, prefix)
+    if label:
+        raise CLIError(
+            "refusing to store likely secret material "
+            f"({label}). Nothing was written."
+        )
+    heading = sanitize_title(title) or "Note"
+    author_label = resolve_author(author)
+    origin_label = parse_provenance_label(origin, "origin", "remember")
+    chosen_tags = normalize_tags(tags)
+    _memory, notes = open_store(project, create=False)
+    stored = load_stored_notes(notes)
+    duplicate, chosen_supersedes, linked = plan_remember(stored, heading, wanted, "", [])
+    if duplicate is not None:
+        return duplicate
+    extra = provenance_lines(author_label, origin_label, chosen_supersedes, linked)
+    created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def factory(note_id: str) -> Iterator[bytes]:
+        head = render_note_head(note_id, heading, created, chosen_tags, extra)
+        yield head.encode("utf-8")
+        if prefix:
+            yield prefix.encode("utf-8")
+        yield from iter_decoded_bytes(source)
+        yield b"\n"
+
+    note_id = publish_new_note(notes, factory)
     return RememberOutcome("wrote", [note_id], chosen_supersedes, linked)
 
 
@@ -1388,7 +1870,6 @@ def cmd_note(project: Path, title: str, body: str, tags: list[str]) -> int:
     text = body.strip()
     if not text:
         raise CLIError("empty note body (pass text arguments or stdin)")
-    reject_oversized_body(text)
     chosen_tags = normalize_tags(tags)
     _memory, notes = open_store(project, create=False)
     heading = sanitize_title(title) or sanitize_title(text.splitlines()[0]) or "Note"

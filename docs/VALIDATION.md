@@ -2,7 +2,7 @@
 
 ## V2
 
-See [CHANGELOG.md](../CHANGELOG.md). `python -m unittest discover -s tests -v` — **75 tests passed** in this V2 change. The suite covers full-note reads, newest-first paging, accent-insensitive BM25, handoff search, `remember`, and harness capture of handoffs.
+See [CHANGELOG.md](../CHANGELOG.md). `python3 -m unittest discover -s tests -v` — **76 tests passed**. The suite covers full-note reads at any size, streamed search, newest-first paging, accent-insensitive BM25, handoff search, `remember`, harness capture of handoffs, and a worker with no default timeout.
 
 ## v0.1.0
 

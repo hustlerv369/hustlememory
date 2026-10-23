@@ -29,8 +29,8 @@ discovery, hook, or network sync.
   changed, it appends a new note linked with `supersedes`. Never overwrite or
   delete a note. Never remember secrets, credentials, or unrelated personal data.
 - `recall` is accent-insensitive BM25. It is not semantic search. It also searches
-  task handoffs. `--limit 0` prints every match; otherwise a `more:` line tells
-  you how to page.
+  task handoffs. `--limit 0` prints every match. Every page prints a `more:` line,
+  including `more: 0 more results` when the page is complete.
 
 ## Commands
 
@@ -78,8 +78,8 @@ a worker means pending review, not accepted.
 
 Windows is tested. macOS/Linux are designed to work (stdlib) and are untested
 here. No delete command. No global memory. Stored notes are not shortened.
-`read` prints a note in full. A note larger than 256 KiB is rejected and is not
-stored in part. `memory.py` does not upload notes.
+`read` prints a note in full. A note of any size is stored in full and can be
+searched. `memory.py` does not upload notes.
 `harness.py --execute` starts a model CLI that may send task context to its
 provider. There is no guarantee against a malicious concurrent process replacing
 files in `.agent-memory`.
