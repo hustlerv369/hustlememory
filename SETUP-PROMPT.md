@@ -35,8 +35,9 @@ workflow. Do not copy private data into a public repository.
    actually use. Do not copy it into every possible global configuration.
    Grok and other shell-capable agents can use the CLI through explicit guidance.
 8. Show me a short project instruction that points to the installed skill or CLI
-   and asks agents to recall context before work and write a handoff afterward.
-   Apply it only in the scope I requested; preserve existing instructions.
+   and tells agents to search memory before work, read matching notes in full,
+   and immediately `remember` new durable facts, decisions, preferences, and
+   outcomes. Apply it only in the scope I requested; preserve existing instructions.
 9. Configure the optional local harness using scripts/harness.py and its --help.
    Find which of Grok, Claude Code, Codex, Kimi, or another local CLI I actually
    have. Inspect each tool's --help. Ask me to confirm my intended providers and
@@ -56,8 +57,9 @@ workflow. Do not copy private data into a public repository.
     push, publish, or delete my data as part of setup.
 
 Use only fictional notes for setup testing. Do not import anyone else's memory
-or export my personal notes. Before storing real information, keep only the
-minimum context needed for this project and follow my agent's permission rules.
+or export my personal notes. Store the decisions and context this project needs.
+Do not store secrets, credentials, or unrelated personal data, and follow my
+agent's permission rules.
 ```
 
 ## Once it is installed

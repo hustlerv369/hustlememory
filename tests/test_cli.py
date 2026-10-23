@@ -288,7 +288,7 @@ class TestNotesAndHandoff(TempProjectTest):
         self.assertIn("Ship the CLI before the skill docs.", read.stdout)
         self.assert_no_home_writes()
 
-    def test_read_truncation_reported(self) -> None:
+    def test_read_returns_the_full_note(self) -> None:
         self.init()
         huge = "alpha " * 40000
         wrote = self.cli(
@@ -303,8 +303,10 @@ class TestNotesAndHandoff(TempProjectTest):
         note_id = wrote.stdout.splitlines()[0].split(" ", 1)[1]
         read = self.cli("read", "--project", str(self.project), note_id)
         self.assertEqual(read.returncode, 0, read.stderr)
-        self.assertIn("truncated:", read.stderr)
-        self.assertIn("truncated:", read.stdout)
+        self.assertNotIn("truncated:", read.stderr)
+        self.assertNotIn("truncated:", read.stdout)
+        self.assertEqual(read.stdout.count("alpha"), 40000)
+        self.assertIn("untrusted data", read.stderr)
 
     def test_commands_require_init(self) -> None:
         listed = self.cli("list", "--project", str(self.project))

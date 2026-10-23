@@ -30,7 +30,7 @@ python scripts/harness.py init --project <root>
 python scripts/harness.py doctor --project <root>
 python scripts/harness.py new --project <root> --title "Title" [--ref path] <description>
 python scripts/harness.py run --project <root> --task <id> --profile <name>
-python scripts/harness.py run --project <root> --task <id> --profile <name> --execute [--timeout 300]
+python scripts/harness.py run --project <root> --task <id> --profile <name> --execute [--timeout 3600]
 python scripts/harness.py status --project <root> [--task <id>]
 python scripts/harness.py accept --project <root> --task <id>
 ```
@@ -48,12 +48,16 @@ the description.
 
 `run` without `--execute` prints the exact argv and exits. `--execute` starts
 that argv with `cwd` set to the selected project. stdout and stderr go to log
-files, not RAM. Default timeout is 300 seconds (bounds 1–86400). On timeout the
+files, not RAM. Default timeout is 3600 seconds (bounds 1–86400). On timeout the
 harness tries to kill the process tree (`taskkill /T` on Windows, process group
 on POSIX). If the platform cannot kill children, the parent is still killed;
 orphans are a documented limit.
 
 `accept` records an explicit review decision by the responsible person or lead agent. It is never implied by exit code 0, and the command itself does not verify quality.
+
+`status` without `--task` lists tasks newest first. `--limit 0` (the default) prints every task. A smaller `--limit` prints `more: N more results, use --offset …` when rows remain.
+
+When a run finishes with a non-empty `handoff.md`, the harness appends a memory note (`remember`) containing the handoff text, the task id, the profile name, and the task state. The handoff file is not edited or deleted. If that text is already stored, the existing note is left unchanged. If the text looks like a secret, or it is too large to store as one note, the note is not written and the handoff stays on disk in full. A saved profile that still sets `--max-turns` or `--no-subagents` produces a warning; new templates do not include those flags.
 
 ## Profiles
 
@@ -81,7 +85,7 @@ Templates shipped disabled (recheck locally):
 
 | Profile | argv0 | Notes |
 |---|---|---|
-| grok | `grok` | `--prompt-file {prompt_file} --cwd {project} --output-format streaming-json --max-turns 20 --no-subagents` |
+| grok | `grok` | `--prompt-file {prompt_file} --cwd {project} --output-format streaming-json` (no turn cap and no `--no-subagents`) |
 | codex | `codex` | `exec --json -C {project}` plus a prompt naming `{prompt_file}` and `{handoff}` |
 | claude | `claude` | `-p` plus `--output-format json`. **Never `--bare`** (API-only). |
 | kimi | `kimi` | `-p` plus `--output-format stream-json` |

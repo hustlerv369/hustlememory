@@ -10,7 +10,7 @@ Use project-local memory. If two agents work on the same project, give both the 
 
 ## Recall before asking again
 
-Before asking a person to repeat a decision, search the project's notes. Read the whole matching note when a short excerpt is insufficient. Then check the current files: an old note is evidence of a past decision, not proof of today's runtime state.
+Before starting work, and before asking a person to repeat a decision, search the project's notes (`recall`, then `read`). A short excerpt or the digest is only an index. Read the whole note when you might rely on it. Then check the current files: an old note is evidence of a past decision, not proof of today's runtime state.
 
 If a note and the user's current request conflict, surface the conflict and follow the applicable current instruction. Do not quietly revive a rejected approach.
 
@@ -27,7 +27,7 @@ Do not infer: tax rules, payment support, or production readiness.
 Verify: inspect the rendered product price after each catalog change.
 ```
 
-Avoid storing a full transcript when a short decision captures the important part. Do not write credentials, private customer records, or unrelated personal information into memory.
+Store the decision with the reasoning, evidence, constraints, and outcome. Do not drop facts for brevity, and do not paste an unrelated chat transcript in place of that decision. As soon as the decision is known, run `remember` so it is not left only in the chat. If that text is already stored, `remember` leaves the existing note unchanged. If the decision changed, `remember` appends a new note and records `supersedes`; it does not edit the old one. Do not write credentials, private customer records, or unrelated personal information into memory. `remember` refuses text that looks like a secret and writes nothing in that case.
 
 ## Keep memory separate from today's handoff
 
@@ -46,7 +46,7 @@ The agent receiving a task may not see the original conversation. Give it a self
 - The commands or observable behavior that will verify the result.
 - A place to write its output and handoff.
 
-Keep instructions proportional to the task. A typo correction does not need a multi-agent workflow. A large audit benefits from a written brief and explicit evidence requirements.
+Match the workflow to the task. A typo correction does not need a multi-agent run. A large audit benefits from a written brief and explicit evidence requirements. Any task that produces a decision still gets a complete memory note. Do not drop stored facts to save tokens.
 
 ## Separate bulk work from final judgment
 

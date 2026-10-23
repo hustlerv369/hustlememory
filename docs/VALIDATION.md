@@ -1,4 +1,10 @@
-# Release validation — v0.1.0
+# Release validation
+
+## V2
+
+See [CHANGELOG.md](../CHANGELOG.md). `python -m unittest discover -s tests -v` — **75 tests passed** in this V2 change. The suite covers full-note reads, newest-first paging, accent-insensitive BM25, handoff search, `remember`, and harness capture of handoffs.
+
+## v0.1.0
 
 Checked on Windows with Python 3.13 on 2026-09-15.
 

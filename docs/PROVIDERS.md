@@ -25,7 +25,7 @@ For Claude Code, the locally inspected `--bare` mode explicitly selected API-ori
 
 ## A useful first live test
 
-After confirming your account and quota, give one installed agent a small fictional task: read a demo decision, summarize it, and write a handoff in the designated task folder. Inspect the resulting file before enabling larger work.
+After confirming your account and quota, give one installed agent a small fictional task: read a demo decision in full, remember it, and write a handoff in the designated task folder. Inspect the resulting file before enabling larger work.
 
 Repeat for each provider you intend to use. Do not infer that a successful Grok test proves Claude, Codex, or Kimi authentication. The repository's automated tests use fake workers and do not consume provider quota.
 

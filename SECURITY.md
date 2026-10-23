@@ -44,7 +44,8 @@ yourself if the directory existed before init.
 - `memory.py` does not use the network, telemetry, or update checks
 - No cloud accounts or credential helpers; harness profiles are argv only
 - No hooks that run on every prompt
-- Memory search does not scan files outside `.agent-memory/notes/`
+- Memory search reads `.agent-memory/notes/` and `.agent-memory/tasks/*/handoff.md`. It does not scan the rest of the project.
+- `remember`, and harness capture of a handoff, refuse text that looks like a private key, a cloud key id, a common token prefix, or a credential assignment. They write nothing in that case. They do not delete a handoff the worker already wrote. This is not a complete secret detector: do not store secrets.
 - No automatic discovery of agents or projects
 - No built-in cross-device sync, native voice/image/video, or all-provider glue
 
