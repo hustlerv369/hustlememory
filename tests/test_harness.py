@@ -147,6 +147,9 @@ class HarnessTest(unittest.TestCase):
         for name, profile in data["profiles"].items():
             self.assertIs(profile["subscription_confirmed"], False, name)
             self.assertNotIn("--bare", profile["argv"])
+        grok_argv = data["profiles"]["grok"]["argv"]
+        self.assertNotIn("--max-turns", grok_argv)
+        self.assertNotIn("--no-subagents", grok_argv)
         second = self.h("init", "--project", str(self.project))
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertIn("harness: exists", second.stdout)
@@ -454,4 +457,172 @@ class HarnessTest(unittest.TestCase):
         templates = source.split("TEMPLATE_PROFILES", 1)[1].split("class CLIError", 1)[0]
         self.assertNotIn("--bare", templates)
         self.assertNotIn("--dangerously-skip-permissions", templates)
+        self.assertNotIn("--max-turns", templates)
+        self.assertNotIn("--no-subagents", templates)
         self.assertIn("BYPASS_FLAGS", source)
+
+    def test_v2_does_not_ship_a_worker_timeout_cap(self) -> None:
+        scripts = str(REPO_ROOT / "scripts")
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        import harness
+
+        self.assertFalse(hasattr(harness, "DEFAULT_TIMEOUT"))
+        self.assertFalse(hasattr(harness, "MAX_TIMEOUT"))
+        source = HARNESS.read_text(encoding="utf-8")
+        self.assertNotIn("DEFAULT_TIMEOUT", source)
+        self.assertNotIn("MAX_TIMEOUT", source)
+        self.assertNotIn("86400", source)
+        version = self.h("--version")
+        self.assertEqual(version.returncode, 0, version.stderr)
+        self.assertIn("V2", version.stdout)
+        self.assertIn("2.0.0", version.stdout)
+        self.init_and_profiles()
+        task_id = self.create_task()
+        dry = self.h(
+            "run",
+            "--project",
+            str(self.project),
+            "--task",
+            task_id,
+            "--profile",
+            "ok",
+        )
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertIn("timeout: none", dry.stdout)
+        zero = self.h(
+            "run",
+            "--project",
+            str(self.project),
+            "--task",
+            task_id,
+            "--profile",
+            "ok",
+            "--timeout",
+            "0",
+        )
+        self.assertEqual(zero.returncode, 0, zero.stderr)
+        self.assertIn("timeout: none", zero.stdout)
+        negative = self.h(
+            "run",
+            "--project",
+            str(self.project),
+            "--task",
+            task_id,
+            "--profile",
+            "ok",
+            "--timeout",
+            "-1",
+        )
+        self.assertNotEqual(negative.returncode, 0)
+        self.assertIn("zero or greater", negative.stderr)
+
+    def test_doctor_warns_when_a_saved_profile_caps_turns(self) -> None:
+        result = self.h("init", "--project", str(self.project))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        path = self.project / ".agent-memory" / "harness.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["profiles"]["grok"]["argv"].extend(["--max-turns", "20", "--no-subagents"])
+        path.write_text(json.dumps(data), encoding="utf-8")
+        doc = self.h("doctor", "--project", str(self.project))
+        self.assertEqual(doc.returncode, 0, doc.stderr)
+        self.assertIn("sets --max-turns", doc.stderr)
+        self.assertIn("sets --no-subagents", doc.stderr)
+
+    def test_status_lists_newest_first_and_pages(self) -> None:
+        result = self.h("init", "--project", str(self.project))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tasks = self.project / ".agent-memory" / "tasks"
+        for name, state in (
+            ("20200101T000000Z-oldtask1", "created"),
+            ("20260101T000000Z-newtask1", "accepted"),
+        ):
+            task_dir = tasks / name
+            task_dir.mkdir()
+            (task_dir / "status.json").write_text(
+                json.dumps({"id": name, "state": state}) + "\n",
+                encoding="utf-8",
+            )
+        page = self.h("status", "--project", str(self.project), "--limit", "1")
+        self.assertEqual(page.returncode, 0, page.stderr)
+        self.assertIn("20260101T000000Z-newtask1", page.stdout)
+        self.assertNotIn("20200101T000000Z-oldtask1", page.stdout)
+        self.assertIn("more: 1 more results, use --offset 1 --limit 1", page.stdout)
+        rest = self.h(
+            "status",
+            "--project",
+            str(self.project),
+            "--offset",
+            "1",
+            "--limit",
+            "1",
+        )
+        self.assertEqual(rest.returncode, 0, rest.stderr)
+        self.assertIn("20200101T000000Z-oldtask1", rest.stdout)
+        self.assertNotIn("20260101T000000Z-newtask1", rest.stdout)
+
+    def test_execute_captures_handoff_into_a_note(self) -> None:
+        self.init_and_profiles()
+        task_id = self.create_task()
+        ran = self.h(
+            "run",
+            "--project",
+            str(self.project),
+            "--task",
+            task_id,
+            "--profile",
+            "ok",
+            "--execute",
+        )
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertIn("captured: ", ran.stdout)
+        notes = list((self.project / ".agent-memory" / "notes").glob("*.md"))
+        self.assertEqual(len(notes), 1)
+        text = notes[0].read_text(encoding="utf-8")
+        self.assertIn("Done.", text)
+        self.assertIn('author: "ok"', text)
+        self.assertIn(f"handoff:{task_id}", text)
+        self.assertIn("tags: [\"handoff\"]", text)
+        handoff = self.project / ".agent-memory" / "tasks" / task_id / "handoff.md"
+        self.assertEqual(handoff.read_text(encoding="utf-8"), "# Handoff\n\nDone.\n")
+        status = json.loads(
+            (self.project / ".agent-memory" / "tasks" / task_id / "status.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(status["capture"], "wrote")
+        self.assertEqual(status["captured_note"], notes[0].stem)
+
+    def test_execute_does_not_copy_a_secret_handoff_into_notes(self) -> None:
+        self.init_and_profiles()
+        worker = self.project / "secret_worker.py"
+        worker.write_text(
+            "import pathlib, sys\n"
+            "pathlib.Path(sys.argv[2]).write_text('api_key=supersecretvalue\\n', encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        self.write_fake_profiles(
+            extra={
+                "leak": {
+                    "subscription_confirmed": True,
+                    "argv": [sys.executable, str(worker), "x", "{handoff}"],
+                }
+            }
+        )
+        task_id = self.create_task()
+        ran = self.h(
+            "run",
+            "--project",
+            str(self.project),
+            "--task",
+            task_id,
+            "--profile",
+            "leak",
+            "--execute",
+        )
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertIn("not copied into a note", ran.stderr)
+        self.assertNotIn("supersecretvalue", ran.stderr)
+        self.assertNotIn("supersecretvalue", ran.stdout)
+        notes = list((self.project / ".agent-memory" / "notes").glob("*.md"))
+        self.assertEqual(notes, [])
+        handoff = self.project / ".agent-memory" / "tasks" / task_id / "handoff.md"
+        self.assertEqual(handoff.read_text(encoding="utf-8"), "api_key=supersecretvalue\n")

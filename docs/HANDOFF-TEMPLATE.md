@@ -10,7 +10,7 @@ What exists now? Which files changed? Use paths appropriate for the receiving ag
 
 ## Decisions to preserve
 
-What must remain true, and why?
+What must remain true, and why? Record the same decisions with `remember`. Do not replace the full note with a shorter paraphrase.
 
 ## Evidence
 
